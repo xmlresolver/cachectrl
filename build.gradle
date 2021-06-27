@@ -1,0 +1,101 @@
+plugins {
+  id "java"
+}
+
+repositories {
+  mavenLocal()
+  mavenCentral()
+  maven { url "https://maven.restlet.com" }
+  maven { url "https://oss.sonatype.org/content/repositories/snapshots" }
+}
+
+configurations.all {
+  resolutionStrategy {
+    force 'xml-apis:xml-apis:1.4.01'
+    force "org.xmlresolver:xmlresolver:${xmlresolverVersion}"
+  }
+}
+
+configurations {
+  standaloneClasspath.extendsFrom(testImplementation)
+}
+
+dependencies {
+  implementation (
+    [group: 'org.xmlresolver', name: 'xmlresolver', version: xmlresolverVersion],
+    [group: 'xml-apis', name: 'xml-apis', version: '1.4.01' ],
+    [group: 'org.slf4j', name: 'slf4j-api', version: '1.7.30' ],
+    [group: 'org.slf4j', name: 'slf4j-simple', version: '1.7.30' ],
+    [group: 'com.beust', name: 'jcommander', version: '1.81' ]
+  )
+}
+
+task setupDist() {
+  FileCollection runtime  = configurations.standaloneClasspath
+  String path = ""
+  runtime.each {
+    File file -> path += " lib/" + file.name
+  }
+  project.ext.runtimeClasspath = path.trim()
+
+  doLast {
+    copy {
+      into { "${buildDir}/dist/lib" }
+      from runtime
+    }
+  }
+}
+
+jar {
+  archiveBaseName = "xmlresolver-cachectrl-${relVersion}"
+  manifest {
+    attributes 'Built-By': 'Norman Walsh'
+    attributes 'Bundle-Vendor': 'Norman Walsh'
+    attributes 'Bundle-Description': 'XML Resolver cache control application.'
+    attributes 'Class-Path': "${project.ext.runtimeClasspath} lib"
+    attributes 'Implementation-Title': 'XML Resolver cache control'
+    attributes 'Implementation-Version': relVersion
+    attributes 'Main-Class': 'org.xmlresolver.apps.cachectrl.CacheCtrl'
+  }
+}
+jar.dependsOn setupDist
+
+// Initially, I simply had the copyJar task copy the built jar
+// into the build/dist directory. But on the CI instance, this
+// always resulted in the files already in build/dist being
+// deleted. I couldn't reliably reproduce that on a Mac or
+// Linux, though I did think it happened once on my Linux test
+// rig. I'm punting and doing this instead, which seems to work.
+task copyJar(dependsOn: ["jar", "setupDist"]) {
+  doLast {
+    copy {
+      into "${buildDir}/stage"
+      from "${buildDir}/dist"
+    }
+  }
+
+  doLast {
+    copy {
+      into "${buildDir}/stage"
+      from "${buildDir}/libs"
+    }
+  }
+}
+
+task dist(dependsOn: ["copyJar", "setupDist"], type: Zip) {
+  from "${buildDir}/stage"
+  into 'xmlresolver-cachectrl-' + relVersion
+  archiveFileName = "xmlresolver-cachectrl-${relVersion}.zip"
+}
+
+// ======================================================================
+
+task helloWorld() {
+  // My task for testing
+  doLast {
+    println("Hello, world.")
+    configurations.standaloneClasspath.each { jar ->
+      println("Classpath: ${jar}")
+    }
+  }
+}

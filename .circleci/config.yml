@@ -1,0 +1,80 @@
+version: 2
+jobs:
+  build:
+    machine:
+      image: ubuntu-1604:202004-01
+
+    java:
+      version: oraclejdk8
+
+    working_directory: ~/repo
+
+    environment:
+      JVM_OPTS: -Xmx16g
+      TERM: dumb
+
+    steps:
+      - add_ssh_keys:
+          fingerprints:
+            - "c7:20:4d:fe:ae:a7:70:39:d2:88:91:c3:68:8b:f8:85"
+
+      - checkout
+
+      - restore_cache:
+          keys:
+            - v1-dependencies-{{ checksum "build.gradle" }}
+            - v1-dependencies-
+
+      - run: ./gradlew dependencies
+
+      - save_cache:
+          paths:
+            - ~/.gradle
+          key: v1-dependencies-{{ checksum "build.gradle" }}
+
+      - run: ./gradlew dist
+
+      - run: ls -lAR build
+
+      - persist_to_workspace:
+          root: build
+          paths:
+            - distributions
+
+  publish-github-release:
+    docker:
+      - image: cibuilds/github:0.10
+    steps:
+      - attach_workspace:
+          at: ./artifacts
+      - run:
+          name: "Publish Release on GitHub"
+          command: |
+            VERSION=${CIRCLE_TAG}
+            ghr -t ${GITHUB_TOKEN} -u ${CIRCLE_PROJECT_USERNAME} -r ${CIRCLE_PROJECT_REPONAME} -c ${CIRCLE_SHA1} ${VERSION} ./artifacts/distributions/
+
+
+workflows:
+  version: 2
+  check:
+    jobs:
+      - build:
+          filters:
+            branches:
+              ignore: gh-pages
+  deploy:
+    jobs:
+      - build:
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: /.+/
+      - publish-github-release:
+          requires:
+            - build
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: /.+/
