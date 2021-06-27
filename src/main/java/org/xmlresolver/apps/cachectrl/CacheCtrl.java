@@ -11,7 +11,6 @@ import com.beust.jcommander.Parameter;
 import com.beust.jcommander.ParameterException;
 import com.beust.jcommander.Parameters;
 import org.xmlresolver.ResolverFeature;
-import org.xmlresolver.ResourceConnection;
 import org.xmlresolver.XMLResolverConfiguration;
 import org.xmlresolver.cache.CacheEntry;
 import org.xmlresolver.cache.CacheInfo;
@@ -23,9 +22,7 @@ import java.io.File;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
-import java.util.Calendar;
 import java.util.Date;
-import java.util.GregorianCalendar;
 import java.util.HashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -35,6 +32,9 @@ import java.util.regex.Pattern;
  * @author ndw
  */
 public class CacheCtrl {
+    // Hack to print the cache directory at most once.
+    private static boolean showCacheDirectory = true;
+
     public static void main(String[] args) {
         CacheCtrl app = new CacheCtrl();
         app.process(args);
@@ -46,6 +46,7 @@ public class CacheCtrl {
         CommandInspect cinspect = new CommandInspect();
         CommandCreate ccreate = new CommandCreate();
         CommandUpdate cupdate = new CommandUpdate();
+        CommandDelete cdelete = new CommandDelete();
         CommandFlush cflush = new CommandFlush();
         JCommander jc = JCommander.newBuilder()
                 .addObject(cmain)
@@ -53,6 +54,7 @@ public class CacheCtrl {
                 .addCommand("inspect", cinspect)
                 .addCommand("create", ccreate)
                 .addCommand("update", cupdate)
+                .addCommand("delete", cdelete)
                 .addCommand("flush", cflush)
                 .build();
 
@@ -77,6 +79,9 @@ public class CacheCtrl {
                         break;
                     case "update":
                         update(cmain, cupdate);
+                        break;
+                    case "delete":
+                        delete(cmain, cdelete);
                         break;
                     case "flush":
                         flush(cmain, cflush);
@@ -114,7 +119,7 @@ public class CacheCtrl {
         String regex = ".*";
         if (command.regex != null) {
             regex = command.regex;
-            System.out.println("Showing all cache entries matching '" + regex + "'");
+            System.out.println("Showing cache entries matching '" + regex + "'");
         }
 
         Pattern pattern = Pattern.compile(regex, Pattern.CASE_INSENSITIVE);
@@ -125,6 +130,7 @@ public class CacheCtrl {
             entrystr = entrystr.substring(0, pos);
 
             count += 1;
+
             Matcher matcher = pattern.matcher(entrystr);
             if (matcher.find()) {
                 if (main.verbose) {
@@ -147,7 +153,9 @@ public class CacheCtrl {
             }
         }
 
-        if (!".*".equals(regex)) {
+        if (match == count) {
+            System.out.println(count + " " + (count == 1 ? "entry" : "entries"));
+        } else {
             System.out.println(match + " of " + count + " entries match");
         }
     }
@@ -181,7 +189,7 @@ public class CacheCtrl {
         for (CacheEntry entry : cache.entries()) {
             CacheInfo info = null;
             for (CacheInfo cached : caching) {
-                if (cached.uriPattern.matcher(entry.uri.toString()).find()) {
+                if (info == null && cached.uriPattern.matcher(entry.uri.toString()).find()) {
                     info = cached;
                 }
             }
@@ -199,11 +207,72 @@ public class CacheCtrl {
                 space = stats.get(info.pattern).space;
                 System.out.println("  Files: " + formatSpace(space) + " in " + count + " "
                         + (count == 1 ? "entry" : "entries"));
-                System.out.println("  Limits: " + formatSpace(info.cacheSpace) + ", " + info.cacheSize + " "
+                System.out.print("  Limits: " + formatSpace(info.cacheSpace) + ", " + info.cacheSize + " "
                         + (info.cacheSize == 1 ? "entry" : "entries"));
+                System.out.print(", delete wait " + formatDuration(info.deleteWait));
+                if (info.maxAge >= 0) {
+                    System.out.print(", max age: " + formatDuration(info.maxAge));
+                }
+                System.out.println();
                 stats.put(info.pattern, new CacheStatistics(info));
             }
         }
+    }
+
+    private String formatDuration(long seconds) {
+        if (seconds < 0) {
+            return "" + seconds;
+        } else if (seconds == 0) {
+            return "0s";
+        }
+
+        long d = 0;
+        long h = 0;
+        long m = 0;
+
+        if (seconds >= 3600 * 24) {
+            long msec = seconds;
+            seconds = seconds % (3600 * 24);
+            msec = msec - seconds;
+            d = msec / (3600 * 24);
+        }
+
+        if (seconds >= 3600) {
+            long hsec = seconds;
+            seconds = seconds % 3600;
+            hsec = hsec - seconds;
+            h = hsec / 3600;
+        }
+
+        if (seconds >= 60) {
+            long msec = seconds;
+            seconds = seconds % 60;
+            msec = msec - seconds;
+            m = msec / 60;
+        }
+
+        StringBuilder sb = new StringBuilder();
+        if (d != 0) {
+            sb.append(d);
+            sb.append("d");
+        }
+
+        if (h != 0 || m != 0 || seconds != 0) {
+            if (h != 0) {
+                sb.append(h);
+                sb.append("h");
+            }
+            if (m != 0) {
+                sb.append(m);
+                sb.append("m");
+            }
+            if (seconds != 0 || m != 0) {
+                sb.append(seconds);
+                sb.append("s");
+            }
+        }
+
+        return sb.toString();
     }
 
     private void create(CommandMain main, CommandCreate command) {
@@ -230,23 +299,31 @@ public class CacheCtrl {
         inspect(main);
     }
 
-    private void flush(CommandMain main, CommandFlush command) {
-        if (command.pattern == null && command.regex == null) {
-            throw new ParameterException("You must specify at least one of -pattern and -regex");
-        }
+    private void createOrUpdate(ResourceCache cache, CommandMain main, CommandCreate command) {
+        long deleteWait = CacheParser.parseTimeLong(command.deleteWait, ResourceCache.deleteWait);
+        long cacheSize = CacheParser.parseSizeLong(command.size, ResourceCache.cacheSize);
+        long cacheSpace = CacheParser.parseSizeLong(command.space, ResourceCache.cacheSpace);
+        long maxAge = CacheParser.parseTimeLong(command.age, ResourceCache.maxAge);
 
+        cache.removeCacheInfo(command.pattern);
+        cache.addCacheInfo(command.pattern, command.include, deleteWait, cacheSize, cacheSpace, maxAge);
+    }
+
+    private void delete(CommandMain main, CommandDelete command) {
         ResourceCache cache = getResourceCache(main);
-        CacheInfo info = null;
-        if (command.pattern != null) {
-            for (CacheInfo cinfo : cache.getCacheInfoList()) {
-                if (command.pattern.equals(cinfo.pattern)) {
-                    info = cinfo;
-                }
-            }
-            if (info == null) {
-                throw new ParameterException("Cannot flush pattern '" + command.pattern + "', it doesn't exist");
-            }
+        boolean found = false;
+        for (CacheInfo info : cache.getCacheInfoList()) {
+            found = found || info.pattern.equals(command.pattern);
         }
+        if (!found) {
+            throw new ParameterException("Cannot delete '" + command.pattern + "', it doesn't exist");
+        }
+        cache.removeCacheInfo(command.pattern);
+        inspect(main);
+    }
+
+    private void flush(CommandMain main, CommandFlush command) {
+        ResourceCache cache = getResourceCache(main);
 
         String regex = ".*";
         if (command.regex != null) {
@@ -254,10 +331,6 @@ public class CacheCtrl {
         }
 
         long count = 0;
-        Pattern infopattern = null;
-        if (info != null) {
-            infopattern = Pattern.compile(info.pattern, Pattern.CASE_INSENSITIVE);
-        }
         Pattern pattern = Pattern.compile(regex, Pattern.CASE_INSENSITIVE);
         for (CacheEntry entry : cache.entries()) {
             // Hack out the arrow pointer
@@ -266,13 +339,7 @@ public class CacheCtrl {
             entrystr = entrystr.substring(0, pos);
 
             Matcher matcher = pattern.matcher(entrystr);
-            boolean matches = matcher.find();
-            if (infopattern != null) {
-                matcher = infopattern.matcher(entrystr);
-                matches = matches && matcher.find();
-            }
-
-            if (matches) {
+            if (matcher.find()) {
                 File centry = new File(entry.entry.baseURI.getPath());
                 if (centry.exists()) {
                     if (!centry.delete()) {
@@ -292,16 +359,6 @@ public class CacheCtrl {
             }
         }
         System.out.println("Flushed " + count + " entries");
-    }
-
-    private void createOrUpdate(ResourceCache cache, CommandMain main, CommandCreate command) {
-        long deleteWait = CacheParser.parseTimeLong(command.deleteWait, ResourceCache.deleteWait);
-        long cacheSize = CacheParser.parseLong(command.size, ResourceCache.cacheSize);
-        long cacheSpace = CacheParser.parseSizeLong(command.space, ResourceCache.cacheSpace);
-        long maxAge = CacheParser.parseTimeLong(command.age, ResourceCache.maxAge);
-
-        cache.removeCacheInfo(command.pattern);
-        cache.addCacheInfo(command.pattern, command.include, deleteWait, cacheSize, cacheSpace, maxAge);
     }
 
     private String formatSpace(long space) {
@@ -334,6 +391,9 @@ public class CacheCtrl {
 
     private ResourceCache getResourceCache(CommandMain main) {
         XMLResolverConfiguration config = new XMLResolverConfiguration();
+        if (main.cacheDirectory != null) {
+            config.setFeature(ResolverFeature.CACHE_DIRECTORY, main.cacheDirectory);
+        }
         ResourceCache cache = config.getFeature(ResolverFeature.CACHE);
         if (cache.directory() == null) {
             if (main.cacheDirectory == null) {
@@ -342,73 +402,13 @@ public class CacheCtrl {
                 throw new ParameterException("Failed to initialize cache: " + main.cacheDirectory);
             }
         }
-        System.out.println("Cache directory: " + cache.directory());
+
+        if (CacheCtrl.showCacheDirectory) {
+            System.out.println("Cache directory: " + cache.directory());
+            CacheCtrl.showCacheDirectory = false;
+        }
+
         return cache;
-    }
-
-    private String showTime(long cacheTime) {
-        String[] months = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-        
-        GregorianCalendar cacheDate = new GregorianCalendar();
-        cacheDate.setTimeInMillis(cacheTime);
-
-        String result = cacheDate.get(Calendar.DAY_OF_MONTH) + " ";
-        result += months[cacheDate.get(Calendar.MONTH)] + " ";
-        result += cacheDate.get(Calendar.YEAR) + " at ";
-        if (cacheDate.get(Calendar.HOUR) < 10) { result += "0"; }
-        result += cacheDate.get(Calendar.HOUR) + ":";
-        if (cacheDate.get(Calendar.MINUTE) < 10) { result += "0"; }
-        result += cacheDate.get(Calendar.MINUTE) + ":";
-        if (cacheDate.get(Calendar.SECOND) < 10) { result += "0"; }
-        result += cacheDate.get(Calendar.SECOND);
-        
-        return result;
-    }
-    
-    private void checkLastModified(CacheEntry entry) {
-        String uri = entry.uri.toString();
-        if (uri.startsWith("file:")) {
-            File src = new File(entry.uri.getPath());
-            if (!src.exists()) {
-                System.out.println("\tFile does not exist");
-            } else {
-                System.out.println("\tLast modified on " + showTime(src.lastModified()));
-                if (src.lastModified() > entry.time) {
-                    System.out.println("\tEXPIRED");
-                }
-            }
-            return;
-        } else if (!uri.startsWith("http:") && !uri.startsWith("https:")) {
-            System.out.println("\tCan't check age of actual resource.");
-            return;
-        }
-
-        ResourceConnection rconn = new ResourceConnection(entry.uri.toASCIIString());
-        rconn.close();
-        long lastModified = rconn.getLastModified();
-        String etag = rconn.getEtag();
-        if (rconn.getStatusCode() != 200) {
-            System.out.println("\tHTTP returned " + rconn.getStatusCode());
-        }
-
-        if (lastModified <= 0) {
-            System.out.println("\tServer did not report last-modified");
-        } else {
-            System.out.println("\tLast modified on " + showTime(lastModified));
-        }
-
-        if (etag != null && entry.etag() != null) {
-            if (etag.equals(entry.etag())) {
-                System.out.println("\tEtags match: " + etag);
-            } else {
-                System.out.println("\tEtags don't match: " + entry.etag() + " ≠ " + etag);
-            }
-        }
-
-        if (lastModified > entry.time) {
-            System.out.println("\tEXPIRED");
-        }
     }
 
     // ============================================================
@@ -463,12 +463,15 @@ public class CacheCtrl {
         // The same parameters, the only difference is whether or not it must exist or must not exist
     }
 
+    @Parameters(separators = ":", commandDescription = "Create a new cache configuration")
+    private class CommandDelete {
+        @Parameter(names = "-pattern", description = "The URI regular expression pattern", required = true)
+        public String pattern;
+    }
+
     @Parameters(separators = ":", commandDescription = "Flush the cache")
     private class CommandFlush {
-        @Parameter(names = "-pattern", description = "The URI regular expression pattern")
-        public String pattern;
-
-        @Parameter(names = {"-regex", "-r"}, description = "A regular expression to filter the entries shown")
+        @Parameter(names = {"-regex", "-r"}, description = "A regular expression to filter the entries shown", required = true)
         private String regex;
     }
 
